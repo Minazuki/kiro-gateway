@@ -33,14 +33,21 @@ import time
 import uuid
 import random
 import string
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.auth import AuthType
+from kiro.config import PROFILE_ARN
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_headers
+
+if TYPE_CHECKING:
+    from kiro.auth import KiroAuthManager
 
 # Import debug_logger
 try:
@@ -74,15 +81,127 @@ def generate_random_id(length: int) -> str:
 # MCP API Functions
 # ==================================================================================================
 
+MCP_REQUEST_TIMEOUT_SECONDS = 60.0
+MCP_ERROR_MESSAGE_LIMIT = 300
+AMAZON_Q_MCP_URL_TEMPLATE = "https://q.{region}.amazonaws.com/mcp"
+
+
+@dataclass(frozen=True)
+class MCPRequestTransport:
+    """Transport settings for one Kiro MCP request."""
+
+    url: str
+    headers: Dict[str, str]
+    include_profile_arn_in_body: bool
+
+
+def _extract_profile_region(profile_arn: str, fallback_region: str) -> str:
+    """
+    Extract the AWS region from a CodeWhisperer profile ARN.
+
+    Args:
+        profile_arn: CodeWhisperer profile ARN.
+        fallback_region: Region to use when the ARN has no region component.
+
+    Returns:
+        Region from the ARN, or the supplied fallback region.
+    """
+    arn_parts = profile_arn.split(":")
+    if len(arn_parts) > 3 and arn_parts[3]:
+        return arn_parts[3]
+
+    logger.warning(
+        "MCP profile ARN does not contain a region; using the authentication region"
+    )
+    return fallback_region
+
+
+def _build_mcp_request_transport(
+    auth_manager: "KiroAuthManager",
+    token: str,
+    profile_arn: str,
+) -> MCPRequestTransport:
+    """
+    Build auth-specific endpoint and headers for Kiro MCP.
+
+    AWS SSO OIDC credentials from kiro-cli must use the Amazon Q endpoint and
+    provide the profile ARN in a request header. Kiro Desktop credentials keep
+    using the runtime endpoint and provide the profile ARN in the JSON-RPC body.
+
+    Args:
+        auth_manager: Active authentication manager.
+        token: Current access token.
+        profile_arn: Resolved account or configured profile ARN.
+
+    Returns:
+        Immutable MCP transport settings for the active authentication type.
+    """
+    headers: Dict[str, str] = get_kiro_headers(auth_manager, token)
+    headers.pop("x-amz-target", None)
+    headers["x-amzn-codewhisperer-optout"] = "false"
+
+    if auth_manager.auth_type == AuthType.AWS_SSO_OIDC:
+        region = _extract_profile_region(profile_arn, auth_manager.region)
+        headers["Content-Type"] = "application/x-amz-json-1.0"
+        headers["x-amzn-kiro-profile-arn"] = profile_arn
+        return MCPRequestTransport(
+            url=AMAZON_Q_MCP_URL_TEMPLATE.format(region=region),
+            headers=headers,
+            include_profile_arn_in_body=False,
+        )
+
+    headers["Content-Type"] = "application/json"
+    return MCPRequestTransport(
+        url=f"{auth_manager.q_host}/mcp",
+        headers=headers,
+        include_profile_arn_in_body=True,
+    )
+
+
+def _get_mcp_error_detail(response: httpx.Response) -> str:
+    """
+    Extract a bounded, non-sensitive error description from an MCP response.
+
+    Args:
+        response: Non-successful MCP HTTP response.
+
+    Returns:
+        Upstream error message suitable for application logs.
+    """
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "upstream response was not valid JSON"
+
+    if not isinstance(payload, dict):
+        return "upstream response did not contain a structured error"
+
+    message = payload.get("message")
+    if not isinstance(message, str):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+        elif isinstance(error, str):
+            message = error
+
+    if not isinstance(message, str) or not message.strip():
+        return "upstream response did not include an error message"
+
+    normalized_message = " ".join(message.split())
+    return normalized_message[:MCP_ERROR_MESSAGE_LIMIT]
+
+
 async def call_kiro_mcp_api(
     query: str,
-    auth_manager
-) -> Tuple[Optional[str], Optional[Dict]]:
+    auth_manager: "KiroAuthManager",
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
     Call Kiro MCP API for web_search.
     
-    URL: {auth_manager.q_host}/mcp
-    Headers: Authorization, x-amzn-codewhisperer-optout, Content-Type
+    Kiro Desktop uses ``{auth_manager.q_host}/mcp`` with a root-level
+    ``profileArn``. AWS SSO OIDC uses the regional Amazon Q MCP endpoint with
+    the profile ARN in ``x-amzn-kiro-profile-arn``.
+
     Timeout: 60 seconds
     
     Args:
@@ -118,6 +237,14 @@ async def call_kiro_mcp_api(
     
     CRITICAL: result.content[0].text is a JSON STRING, not a dict!
     """
+    profile_arn = auth_manager.profile_arn or PROFILE_ARN
+    if not profile_arn:
+        logger.error(
+            "MCP web search requires a profile ARN. Configure PROFILE_ARN or use "
+            "credentials that expose an account profile."
+        )
+        return None, None
+
     # Generate IDs
     random_22 = generate_random_id(22)
     timestamp = int(time.time() * 1000)
@@ -135,37 +262,42 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
-    
-    # Log MCP request
-    try:
-        mcp_request_json = json.dumps(mcp_request, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
-            debug_logger.log_raw_chunk(b"[MCP REQUEST]\n" + mcp_request_json)
-    except Exception as e:
-        logger.warning(f"Failed to log MCP request: {e}")
-    
+
     try:
         token = await auth_manager.get_access_token()
-        
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
-        
-        mcp_url = f"{auth_manager.q_host}/mcp"
-        logger.debug(f"Calling MCP API: {mcp_url}")
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(mcp_url, json=mcp_request, headers=headers)
-            
+        transport = _build_mcp_request_transport(auth_manager, token, profile_arn)
+        if transport.include_profile_arn_in_body:
+            mcp_request["profileArn"] = profile_arn
+
+        if debug_logger:
+            debug_request = dict(mcp_request)
+            if "profileArn" in debug_request:
+                debug_request["profileArn"] = "[REDACTED]"
+            mcp_request_json = json.dumps(
+                debug_request,
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            debug_logger.log_raw_chunk(b"[MCP REQUEST]\n" + mcp_request_json)
+
+        logger.debug(f"Calling MCP API: {transport.url}")
+
+        async with httpx.AsyncClient(timeout=MCP_REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                transport.url,
+                json=mcp_request,
+                headers=transport.headers,
+            )
+
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                error_detail = _get_mcp_error_detail(response)
+                logger.error(
+                    f"MCP API error: {response.status_code} - {error_detail}"
+                )
                 return None, None
-            
+
             mcp_response = response.json()
-            
+
             # Log MCP response
             try:
                 mcp_response_json = json.dumps(mcp_response, ensure_ascii=False, indent=2).encode('utf-8')

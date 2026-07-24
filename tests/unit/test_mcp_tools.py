@@ -15,7 +15,7 @@ Tests cover:
 import json
 import pytest
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
-from datetime import datetime
+from datetime import datetime, timezone
 
 from kiro.mcp_tools import (
     generate_random_id,
@@ -134,8 +134,22 @@ class TestCallKiroMCPAPI:
         mock_client.__aenter__.return_value.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", "configured-fallback-must-not-win"),
+            patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client),
+        ):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
+
+        sent_url = mock_post.call_args.args[0]
+        sent_request = mock_post.call_args.kwargs["json"]
+        sent_headers = mock_post.call_args.kwargs["headers"]
+        print("Verifying Kiro Desktop MCP transport...")
+        assert sent_url == f"{mock_auth_manager.q_host}/mcp"
+        assert sent_request["profileArn"] == mock_auth_manager.profile_arn
+        assert sent_headers["Content-Type"] == "application/json"
+        assert "x-amzn-kiro-profile-arn" not in sent_headers
+        assert "x-amz-target" not in sent_headers
+        assert "User-Agent" in sent_headers
         
         print(f"Comparing tool_use_id: Got '{tool_use_id}'")
         assert tool_use_id is not None
@@ -146,6 +160,141 @@ class TestCallKiroMCPAPI:
         assert results["totalResults"] == 1
         assert results["results"][0]["title"] == "Python Tutorial"
         assert results["results"][0]["url"] == "https://python.org"
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_uses_configured_profile_arn_fallback(
+        self,
+        mock_auth_manager,
+    ):
+        """
+        What it does: Uses PROFILE_ARN when account metadata has no profile ARN.
+        Purpose: Support credentials whose account profile is configured externally.
+        """
+        print("Setup: Removing the account profile ARN and configuring a fallback...")
+        mock_auth_manager._profile_arn = None
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "id": "test-id",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{"type": "text", "text": '{"results": []}'}],
+                "isError": False,
+            },
+        }
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+        fallback_profile_arn = (
+            "arn:aws:codewhisperer:us-east-1:000000000000:profile/test"
+        )
+
+        print("Action: Calling MCP API with configured fallback...")
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", fallback_profile_arn),
+            patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client),
+        ):
+            tool_use_id, results = await call_kiro_mcp_api(
+                "test",
+                mock_auth_manager,
+            )
+
+        sent_request = mock_post.call_args.kwargs["json"]
+        print("Verifying configured ARN is included at the JSON-RPC root...")
+        assert sent_request["profileArn"] == fallback_profile_arn
+        assert tool_use_id is not None
+        assert results == {"results": []}
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_without_profile_arn_fails_before_network(
+        self,
+        mock_auth_manager,
+    ):
+        """
+        What it does: Rejects MCP search when no profile ARN is available.
+        Purpose: Avoid an opaque upstream 400 and unnecessary network request.
+        """
+        print("Setup: Removing account and configured profile ARNs...")
+        mock_auth_manager._profile_arn = None
+        mock_client_factory = Mock()
+
+        print("Action: Calling MCP API without any profile ARN...")
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", ""),
+            patch(
+                "kiro.mcp_tools.httpx.AsyncClient",
+                mock_client_factory,
+            ),
+        ):
+            tool_use_id, results = await call_kiro_mcp_api(
+                "test",
+                mock_auth_manager,
+            )
+
+        print("Verifying request fails locally without opening an HTTP client...")
+        assert tool_use_id is None
+        assert results is None
+        mock_client_factory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sso_account_uses_amazon_q_mcp_transport(self):
+        """
+        What it does: Routes kiro-cli AWS SSO credentials to Amazon Q MCP.
+        Purpose: Prevent runtime.kiro.dev 400/403 failures for SQLite credentials.
+        """
+        from kiro.auth import KiroAuthManager
+
+        print("Setup: Creating an AWS SSO OIDC authentication manager...")
+        profile_arn = (
+            "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test"
+        )
+        manager = KiroAuthManager(
+            refresh_token="test_refresh_token",
+            profile_arn=profile_arn,
+            region="us-east-1",
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+        )
+        manager._access_token = "test_access_token"
+        manager._expires_at = datetime.now(timezone.utc).replace(year=2099)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "id": "test-id",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": '{"results": [], "totalResults": 0}',
+                }],
+                "isError": False,
+            },
+        }
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling MCP API with AWS SSO OIDC credentials...")
+        with patch(
+            "kiro.mcp_tools.httpx.AsyncClient",
+            return_value=mock_client,
+        ):
+            tool_use_id, results = await call_kiro_mcp_api("test", manager)
+
+        sent_url = mock_post.call_args.args[0]
+        sent_request = mock_post.call_args.kwargs["json"]
+        sent_headers = mock_post.call_args.kwargs["headers"]
+        print("Verifying Amazon Q endpoint and profile header...")
+        assert sent_url == "https://q.eu-central-1.amazonaws.com/mcp"
+        assert "profileArn" not in sent_request
+        assert sent_headers["x-amzn-kiro-profile-arn"] == profile_arn
+        assert sent_headers["Content-Type"] == "application/x-amz-json-1.0"
+        assert sent_headers["Authorization"] == "Bearer test_access_token"
+        assert "x-amz-target" not in sent_headers
+        assert "User-Agent" in sent_headers
+        assert tool_use_id is not None
+        assert results == {"results": [], "totalResults": 0}
     
     @pytest.mark.asyncio
     async def test_mcp_api_error_response(self, mock_auth_manager):
@@ -189,19 +338,34 @@ class TestCallKiroMCPAPI:
         query = "test"
         
         mock_response = Mock()
-        mock_response.status_code = 500
+        mock_response.status_code = 400
+        mock_response.json.return_value = {
+            "message": "profileArn is required for this request.",
+            "reason": None,
+            "profileArn": "must-not-be-logged",
+        }
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.post = mock_post
         
         print("Action: Calling call_kiro_mcp_api...")
-        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
-            tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
+        with (
+            patch("kiro.mcp_tools.logger.error") as mock_logger_error,
+            patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client),
+        ):
+            tool_use_id, results = await call_kiro_mcp_api(
+                query,
+                mock_auth_manager,
+            )
         
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
         assert tool_use_id is None
         assert results is None
+        logged_message = mock_logger_error.call_args.args[0]
+        assert "400" in logged_message
+        assert "profileArn is required for this request." in logged_message
+        assert "must-not-be-logged" not in logged_message
     
     @pytest.mark.asyncio
     async def test_mcp_api_timeout(self, mock_auth_manager):
